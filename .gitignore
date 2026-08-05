@@ -1,0 +1,4 @@
+# 大镜像不入库（用 scripts/download_image.sh 下载）
+*.img
+*.img.gz
+.DS_Store
