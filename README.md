@@ -4,10 +4,13 @@
 > 所有操作都在 **macOS** 上完成，无需 Windows 虚拟机、无需 Rufus。
 > 本指南是作者在真实踩坑中整理出来的，专门收录了那些官方文档不会告诉你的 macOS 坑。
 
+📌 **N1 已经跑起来、想在它身上继续堆功能？** 看续篇 → [`docs/n1-ops-guide.md`](docs/n1-ops-guide.md)（PassWall 故障转移、HA/HomeKit、工作台门户、Outline、以及「手机打不开 X」完整排障 + 总踩坑清单）。
+
 ---
 
 ## 目录
 
+- [续篇：N1 上线后运维折腾全记录](docs/n1-ops-guide.md)
 - [0. 这套方案解决什么问题](#0-这套方案解决什么问题)
 - [1. 配件准备](#1-配件准备)
 - [2. 下载 iStoreOS 镜像](#2-下载-istoreos-镜像)
@@ -263,7 +266,9 @@ n1-istoreos-macos-guide/
 │   ├── write_n1_reset.sh          # Mac 写盘脚本（自动识别 U 盘，重置为默认密码）
 │   └── discover_n1.sh             # 局域网扫描找 N1（接路由器场景）
 └── docs/
-    └── troubleshooting.md         # 排错细节 + macOS 坑合集
+    ├── troubleshooting.md         # 排错细节 + macOS 坑合集
+    ├── n1-ops-guide.md           # 续篇：上线后运维折腾全记录（功能/过程/踩坑）
+    └── pw-fo.example.json        # sing-box 故障转移池配置模板（脱敏）
 ```
 
 ---

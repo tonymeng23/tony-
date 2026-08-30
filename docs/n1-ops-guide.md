@@ -1,0 +1,289 @@
+# N1 上线后运维折腾全记录（功能 / 过程 / 踩坑）
+
+> 本篇是主指南 `README.md`（刷机 → 旁路由）的**续集**：N1 已经跑起来之后，上面陆续堆了哪些东西、怎么堆的、以及每个功能踩过的坑。
+> 适合已经按主指南装好 N1、想在它身上继续加功能的同学。
+>
+> ⚠️ **安全说明**：本仓库是公开仓库，文中所有密钥、密码、订阅节点参数（UUID / public_key / short_id / SS 密码 / root 口令）均已**打码**，只保留架构、流程与坑位。需要复现请用自己的订阅与凭证替换占位符。
+
+---
+
+## 0. 当前家底（一台 N1 上跑了什么）
+
+| 功能 | 说明 | 监听 / 路径 |
+|------|------|------|
+| iStoreOS 旁路由 | 全家网关 + DNS + 代理入口 | `192.168.0.2` |
+| PassWall + sing-box 故障转移 | 透明代理，anytls 4 节点池 urltest 自动切换 | nft `:11211` 入、`SOCKS :11111` 出 |
+| Home Assistant | Docker host 网络，米家/设备中枢 | `:8123`，数据 `/mnt/mmc1-4/homeassistant` |
+| HomeKit 桥 | HA 内置，唯一对外语音/控制通道 | `:21063`，mDNS `Home Assistant Bridge 6D194F` |
+| xiaomi_home 集成 | 米家设备接入 HA | config entry |
+| 工作站门户 | nginx:alpine 反代 LuCI/HA/MC + 状态页 | `:8888` |
+| Outline Server | Shadowbox（arm64），独立 VPN | API `:19001`（规避 PassWall 抢占）|
+| pw_adblock | dnsmasq 广告域名黑洞 | 写 `/etc/dnsmasq.conf` |
+| 每日备份 | NAS 日志自动备份 | `backup-to-nas.sh` 每 05:00 → `/mnt/nas/n1-backup` |
+
+**硬件 / 网络拓扑**
+
+```
+                公网 (南京移动动态 IP, 非 CGNAT)
+                        │
+            TP-Link TL-7DR3630 (主路由, 192.168.0.1)
+            ├─ DHCP: 下发网关/DNS = 192.168.0.2 (N1)
+            └─ 端口映射: 把公网端口转给 N1 (暴露公网必须在这做)
+                        │
+            斐讯 N1 (旁路由, 192.168.0.2)
+            ├─ ARM A53 四核 / 2GB / Docker 27.3.1
+            ├─ eMMC: p4 = /mnt/mmc1-4 (存 HA / docker / 配置)
+            └─ U 盘: /dev/sda 保留作回退 (勿删 sda4/n1-emmc-backup)
+```
+
+> 关键认知：**N1 兼任全家网关 + HA，绝不能被打满 CPU**，否则全家断网。改任何 N1 配置后每日 03:15 自动同步 overlay，无需手动。
+
+---
+
+## 1. 硬规则（防灾难 · 先读这段再动任何东西）
+
+以下任一条踩中都是 **P0 全家断网 / 数据全丢**，务必背熟：
+
+| # | 规则 | 后果 |
+|---|------|------|
+| 1 | **绝不在 N1 部署 Minecraft / box64 / amd64 服务** | 曾拖垮网关，全家断网。MC 改 x86 / 树莓派 / 云 |
+| 2 | **禁用 `/usr/sbin/install-to-emmc.sh`** | 它会 `dd` 清 eMMC 引导区并抹掉 p4（HA/docker 数据）。系统已迁 eMMC，U 盘只作回退 |
+| 3 | **改 HA `.storage/*.json` 必须先 `docker stop homeassistant`** | 否则 HA 退出时用内存态覆盖文件，改动丢失 |
+| 4 | **passwall 热重载（reload/restart/stop+start）会 OOM 卡死 N1** | 改代理模式只 `uci set` + `uci commit`，靠物理重启冷启动生效 |
+
+补充：N1 只有 2GB RAM，PassWall 重载有 OOM 风险窗口，任何重载操作尽量放在无人用网时段，且准备好「拔电冷启」兜底。
+
+---
+
+## 2. PassWall 旁路由 & 透明代理
+
+### 2.1 透明代理生效前提
+
+透明代理**不是自动对所有设备生效**，它依赖一条铁律：
+
+> **设备网关必须是 N1（192.168.0.2）**。
+
+做法：在主路由 TP-Link 的 DHCP 里把「默认网关 / DNS」都改成 `192.168.0.2`。这样设备的流量才会被 N1 的 nftables 接管、按规则分流。
+
+> ⚠️ 坑位：手机的「网关」和「DNS」是**两个独立项**。即使 DNS 填了 `.2`，只要网关还是主路由 `.1`，境外流量就从主路由直出 → 被墙。排查「某设备不通」第一步永远是先看它的**网关**是不是 `.2`。
+
+### 2.2 代理模式切换（正确姿势）
+
+当前模式 = **proxy 全局（绕过国内）**。切换位置有两处且**必须同步**：
+
+```sh
+uci set passwall.@global[0].tcp_proxy_mode='xxx'
+uci set passwall.@global[0].udp_proxy_mode='xxx'
+uci set passwall.@acl_rule[1].tcp_proxy_mode='xxx'   # ACL 规则也要同步
+uci set passwall.@acl_rule[1].udp_proxy_mode='xxx'
+uci commit passwall
+# ⚠️ 只 commit，不要 reload/restart（见硬规则 #4）
+```
+
+### 2.3 代理故障转移系统（sing-box anytls 4 节点池）
+
+这是 N1 代理的「心脏」，配置文件 `/mnt/mmc1-4/pw-failover/pw-fo.json`：
+
+```
+设备流量 ──nft :11211 (TPROXY)──▶ sing-box 实例
+                                      │  anytls 4 节点池 (urltest 10s 自动切换)
+                                      ▼
+                                 选中最优节点出网
+SOCKS 出口 :11111 (供内部服务/调试用)
+```
+
+- **DNS 链路**：`:53 → 11401(dnsmasq) → 11501(chinadns) → 11311(dns2socks) → 1.1.1.1`
+- **看门狗**：`watchdog-daemon.sh` 常驻 20s 轮询；`rc.local` 里 `sleep 180` 开机自愈
+- **实时状态页**：`http://192.168.0.2:8888/pw-status/`
+
+⚠️ **sing-box 配置坑位（版本相关）**：
+- sing-box 1.13.14 **没有 `random` 组**（只有 `urltest`）→ 池只用 `urltest`
+- 老配置里 `blackhole` 在新版要改成 `block`
+- `dns2socks` 出站要 **3 个参数**（监听 / 上游 DNS / 出口标签），少一个起不来
+- `vless-reality` 与 xray **不互通** → 池里统一只用 anytls，别混
+
+### 2.4 NAS-ACL 修复（透明代理被架空）
+
+NAS（`.114`）要走直连，但 nftables 的 `PSW_NAT/MANGLE` 里 `direct` 的 `return` **必须带源地址**，否则会把本该代理的流量也一起 return 掉，架空透明代理：
+
+```
+# 正确：direct 的 return 必须限定源
+ip saddr 192.168.0.114 return
+```
+
+修复脚本挂 `rc.local`：`/mnt/mmc1-4/fix-passwall-nas-acl.sh`
+
+---
+
+## 3. 📱 手机打不开 X 的完整排障案例（数据中心 IP 被风控）
+
+这是最经典、最容易被误判的一案，完整复盘一遍，因为排查路径本身就有好几处坑。
+
+### 3.1 现象
+
+- Mac 能开 X（走本地 ClashX 代理），**手机打不开**
+- 手机「网关」显示 `192.168.0.2`（正确）、「DNS」也是 `.2`（正确）
+- 手机**浏览器和 App 都打不开**，开飞行模式重连也没用
+
+### 3.2 逐层排查（以及每一步的误判与自我修正）
+
+| 步 | 怀疑 | 验证动作 | 结果 | 结论 |
+|----|------|----------|------|------|
+| 1 | DNS 污染 | `dig` 主路由 `.1` 与 N1 `.2` 解析 x.com，各连测 10+ 次 | 两边**都干净**（`.1`→`172.66.0.227` 12/12；`.2`→`151.101.66.146` 8/8 一致）| ❌ 排除 |
+| 2 | 透明代理没接管手机 | N1 上 `tcpdump -i br-lan host 手机IP` 抓包 | 手机**双向流量都经 N1**，TCP 连接成功、传了 ~700KB 数据 | ❌ 排除代理入口 |
+| 3 | IPv6 绕过代理 | 查 N1 `br-lan` 地址 + 手机 IPv6 邻居 + x.com AAAA | N1 只有链路本地、手机无全局 IPv6、x.com 无 AAAA | ❌ 排除 |
+| 4 | PassWall ACL 把手机旁路 | `uci show passwall` 看 ACL | 只有 NAS(`.114`) 是直连，手机落在 `proxy` 规则 | ❌ 排除 |
+| 5 | **出口 IP 类型不对** | 对比 Mac(ClashX) 与 手机(N1 sing-box) 的出口 IP | 🎯 见下 | ✅ **命中根因** |
+
+> 第 1 步里有个**自我修正**：一开始 `dig +short | grep IP` 把非 A 记录过滤掉，误以为主路由 `.1` 无应答（以为污染）。加 `+comments +stats` 一看其实是 NOERROR、有 ANSWER——**是自己的过滤命令骗了自己**，不是 DNS 问题。教训：`+short` 配 `grep` 会漏记录，验证 DNS 一定要看完整 ANSWER SECTION。
+
+### 3.3 根因（一句话）
+
+**X / Twitter 对「数据中心 IP」风控极严。** N1 的 sing-box 节点池是闲快机场的美国节点（出口 `167.253.96.177`，美国 BAGE CLOUD 数据中心）。手机连上了 TCP、也收到部分响应，但核心 API 请求全被拒 → 界面永远转圈 → 你看到的就是「打不开」。
+
+而 Mac 走 ClashX 的**香港 HKT 家宽节点**（出口 `209.9.200.1`）→ X 正常放行。
+
+佐证：同环境下 facebook 老段 IP 走代理能 200，但 twitter 老段 IP 全超时——X 的风控比 FB 严得多。
+
+### 3.4 解决（切到香港家宽出口）
+
+1. **拿节点**：闲快订阅源当时 502 不可用 → 改从 Mac 的 Clash Verge（小草莓机场）订阅里提取**香港家宽节点**（vless reality，`server=ooww.appcli.cc`），参数齐全且 Mac 正在用它（证明端口可达）。
+2. **备份**：`cp pw-fo.json pw-fo.json.bak-$(date +%Y%m%d)`
+3. **改配置**：把香港节点（香港家庭 / 香港01 / 香港02）加入 sing-box 池，与美国家庭节点组成 urltest 池，final 指向池。
+4. **重启主实例**：`kill <主实例PID>` → 看门狗 20s 内自动拉起新配置（**不要手动 restart passwall**）。
+5. **验证**：
+   - 出口 IP → `209.9.200.1`（香港 HKT 家宽，与 Mac 一致）
+   - `x.com` → **200**（0.7s）、twitter 老段 IP → **301**、google → **302**
+
+> ✅ 切换后手机无需改任何设置，N1 透明代理自动走香港家宽出口，X 直接能开。
+
+### 3.5 本案顺带发现的坑（都记下来）
+
+- **机场节点域名会被 DNS 污染**：`xgbgpwww.appcli.cc` 被解析到假 IP `82.38.46.68`（英国），直连必超时。必须用**走代理的 DNS 通道**（`11311` dns2socks→1.1.1.1，或 Mac 的 ClashX 出口做 DoH）拿到真实 IP。
+- **香港落地节点国内直连不可达**，但中转入口同 IP 段可达（服务器对裸 TCP 探测不响应，但对协议流量正常，所以 `nc` 测端口显示 CLOSED 是**误判**）。
+- **N1 上 busybox `netstat` 显示不可靠**：核对监听端口用 `/proc/net/tcp` + 端口号十六进制（如 `11211` → `2BC3`、`11111` → `2B67`）。
+- **`pkill -f "run -c /tmp/sb-test"` 会匹配到 ssh 自身 shell** 把会话杀掉 → 用 `pgrep` 拿精确 PID 再 `kill -9`。
+
+---
+
+## 4. Home Assistant
+
+### 4.1 部署
+
+- Docker **host 网络**，配置目录 `/mnt/mmc1-4/homeassistant`
+- SSH：`root` / <密码见本地，勿入公库>
+
+### 4.2 改 `.storage` 必须先停容器（P0，见硬规则 #3）
+
+HA 退出时会把内存态写回 `.storage/*.json`。**任何直接改 `.storage` 文件的操作，必须先 `docker stop homeassistant`**，改完再起，否则白改。
+
+### 4.3 xiaomi_home 集成（米家）
+
+- ⚠️ **无 reauth 流程** → token 失效只能删 config entry 重授权。曾因 `96009 invalid refresh token` 一次挂掉 525 个实体。
+- 重新授权用 `http://192.168.0.2:8123`（**`homeassistant.local` 解析不了**，别用于 OAuth 回调地址）。
+- 小米 API 域名（`account.xiaomi.com` / `home.mi.com` 等）走 `psw_chn` **直连**，不受代理影响。
+- 控制码 `ctrl_mode=auto`（本地优先 → 云端兜底）。
+- 命令失败码 `-30012` / `-9999` = 传输/设备层无法送达（设备离线或本地控制未建立），**不是 HomeKit 问题**。
+- 健康接入状态页：`http://192.168.0.2:8888/pw-status/`（探活 8123 + 日志匹配 `invalid refresh token` + config entry 存在性）。
+
+### 4.4 HomeKit 桥（唯一对外语音/控制通道）
+
+- 监听 `192.168.0.2:21063`，mDNS 名 `Home Assistant Bridge 6D194F`。
+- **配对码每次 HA 重启随机生成**，在 HA 日志里（`logger: homeassistant.components.homekit: info`）。`paired_clients` 会保留 → iPhone 免重配。
+- 暴露实体 ID 硬编码在 `homekit.<id>.options.filter.include_entities`，由 `厂商_cn_did_型号` 生成、**与 config entry 无关** → 重加小米集成后 ID 一致 → 自动回 HomeKit。
+- **重置小米集成时 HomeKit 安全做法**：删 xiaomi config entry + 清 `.storage/xiaomi_home/cert/` 后干净重启，桥暴露列表不动。
+
+---
+
+## 5. 工作站门户（nginx, `192.168.0.2:8888`）
+
+- `nginx:alpine`，反向代理 LuCI / HA / MC。
+- ⚠️ **CSP 必须含** `script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'`，否则页面脚本被拦。
+- 重部署：`sh /mnt/mmc1-4/workstation/deploy.sh`
+- 实时状态 `/api/status` ← `status-gen.sh`（rc.local 每 5s）→ `status.json`
+- UI 方向：Apple **Liquid Glass** 玻璃拟态 + hover 缩放 + 点击涟漪式分层反馈。
+
+---
+
+## 6. Outline Server（Shadowbox, arm64）
+
+- API 端口设为 **`19001`** 规避 PassWall 抢占（默认 1xxxx 会被代理逻辑吃到）。
+- 用 arm64 社区镜像；部署在 N1 上作独立 VPN 通道。
+
+---
+
+## 7. 每日备份
+
+- `/usr/local/bin/backup-to-nas.sh` 每 05:00 自动把 NAS 日志备份至 `/mnt/nas/n1-backup`。
+- 改 N1 配置后每日 03:15 自动同步 overlay（无需手动）。
+
+---
+
+## 8. 磁盘拓扑与备份
+
+```
+/dev/sda        = U 盘（原启动盘，保留回退，勿删 sda4 / n1-emmc-backup）
+/dev/mmcblk1    = eMMC（p4 = /mnt/mmc1-4 存 HA / docker / 配置）
+备份位置：/mnt/mmc1-4/backup/、backup-n1/
+```
+
+> 回退策略：U 盘保留作「系统挂了能拔盘恢复原厂」的保命盘，别手痒格式化。
+
+---
+
+## 9. 总踩坑清单（P0 ~ P2）
+
+| 严重度 | 坑 | 症状 | 正确做法 |
+|--------|----|------|----------|
+| **P0** | N1 跑 Minecraft/amd64 服务 | 全家断网 | 绝不部署，MC 移走 |
+| **P0** | 执行 `install-to-emmc.sh` | eMMC 引导区被 dd、HA/docker 数据全没 | 禁用该脚本 |
+| **P0** | 不停 HA 容器就改 `.storage` | 改动被内存态覆盖丢失 | 先 `docker stop homeassistant` |
+| **P0** | passwall 热重载 | OOM 卡死 N1 | 只 `uci commit`，物理重启冷启 |
+| **P1** | 设备网关不是 N1 | 国内通、境外 App 不通 | DHCP 网关/DNS 改 `.2` |
+| **P1** | 节点池出口是数据中心 IP | X/Twitter 打不开（TCP 通但请求被拒）| 换香港/家宽节点 |
+| **P1** | 机场域名被 DNS 污染 | 节点连不上/超时 | 走代理 DNS 解析真实 IP |
+| **P1** | xiaomi_home token 失效 | 几百实体全挂 | 删 config entry 重授权（无 reauth）|
+| **P2** | `dig +short\|grep` 验证 DNS | 误以为污染（漏非 A 记录）| 看完整 ANSWER SECTION |
+| **P2** | busybox netstat 不可靠 | 误判端口未监听 | 查 `/proc/net/tcp` + hex 端口 |
+| **P2** | `pkill -f` 匹配到 ssh 自身 | 会话被杀 | 用精确 PID |
+| **P2** | sing-box 版本差异 | `random` 组/`blackhole` 报错 | 只用 `urltest`、`block` |
+| **P2** | NAS-ACL direct 漏源地址 | 透明代理被架空 | return 带 `ip saddr 192.168.0.114` |
+
+---
+
+## 10. 常用命令速查
+
+```sh
+# —— N1 健康检查 ——
+ssh root@192.168.0.2 'uptime; free -m | head -3; pgrep -c sing-box'
+# 透明代理入口监听 (11211=0x2BC3, 11111=0x2B67)
+ssh root@192.168.0.2 "grep -iE '2BC3|2B67' /proc/net/tcp"
+
+# —— 代理出口 IP / X 可达性（走 sing-box SOCKS :11111）——
+ssh root@192.168.0.2 "curl -x socks5h://127.0.0.1:11111 -s https://ipinfo.io/json"
+ssh root@192.168.0.2 "curl -x socks5h://127.0.0.1:11111 -s -o /dev/null -w '%{http_code}' https://x.com"
+
+# —— 切节点流程 ——
+ssh root@192.168.0.2 "cp /mnt/mmc1-4/pw-failover/pw-fo.json /mnt/mmc1-4/pw-failover/pw-fo.json.bak-\$(date +%Y%m%d)"
+# (编辑 pw-fo.json 加入家宽节点 →) kill 主实例 PID，等看门狗拉起
+
+# —— DNS 污染验证（看完整 ANSWER，别只 grep IP）——
+dig @192.168.0.1 x.com +comments +stats        # 主路由
+dig @192.168.0.2 x.com +comments +stats        # N1
+
+# —— 手机流量抓包 ——
+ssh root@192.168.0.2 "tcpdump -i br-lan -nn host <手机IP> -w /tmp/phone.pcap"
+
+# —— HA 安全改配置 ——
+ssh root@192.168.0.2 "docker stop homeassistant && vi /mnt/mmc1-4/homeassistant/.storage/xxx && docker start homeassistant"
+```
+
+---
+
+## 附录：本文与其他文档的关系
+
+- `README.md`：刷机 → iStoreOS → 旁路由**初始化**（macOS 视角）
+- `docs/troubleshooting.md`：初始化阶段的 macOS / 网络坑
+- **`docs/n1-ops-guide.md`（本篇）**：N1 **上线后**各项功能运维、过程与踩坑
+
+欢迎 PR 补充你自己的坑。

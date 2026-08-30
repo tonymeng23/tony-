@@ -1,0 +1,113 @@
+{
+  "_comment": "N1 sing-box 故障转移池配置模板（脱敏）。真实 server/port/uuid/public_key/short_id/password 取自你的机场订阅，替换占位符即可。路径 /mnt/mmc1-4/pw-failover/pw-fo.json",
+  "log": { "level": "warn", "timestamp": true },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "0.0.0.0",
+      "listen_port": 11211,
+      "network": "tcp,udp"
+    },
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 11111
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "failover-pool",
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "10s",
+      "tolerance": 50,
+      "outbounds": ["hk-home", "hk-01", "hk-02", "us-home"]
+    },
+    {
+      "type": "vless",
+      "tag": "hk-home",
+      "server": "<香港节点server，如 ooww.appcli.cc>",
+      "server_port": 48571,
+      "uuid": "<你的uuid>",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "<sni，如 www.example.com>",
+        "utls": { "enabled": true, "fingerprint": "safari" },
+        "reality": {
+          "enabled": true,
+          "public_key": "<reality public_key>",
+          "short_id": "<short_id>"
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "hk-01",
+      "server": "<香港节点2 server>",
+      "server_port": 48524,
+      "uuid": "<你的uuid>",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "<sni>",
+        "utls": { "enabled": true, "fingerprint": "safari" },
+        "reality": {
+          "enabled": true,
+          "public_key": "<reality public_key>",
+          "short_id": "<short_id>"
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "hk-02",
+      "server": "<香港节点3 server>",
+      "server_port": 48525,
+      "uuid": "<你的uuid>",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "<sni>",
+        "utls": { "enabled": true, "fingerprint": "safari" },
+        "reality": {
+          "enabled": true,
+          "public_key": "<reality public_key>",
+          "short_id": "<short_id>"
+        }
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "us-home",
+      "server": "<美国家庭节点 server>",
+      "server_port": 48723,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "<ss2022 双PSK: base64key1:base64key2>"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "route": {
+    "final": "failover-pool",
+    "auto_detect_interface": true
+  },
+  "dns": {
+    "servers": [
+      { "tag": "remote", "address": "https://1.1.1.1/dns-query", "detour": "failover-pool" },
+      { "tag": "local", "address": "114.114.114.114" }
+    ],
+    "rules": [
+      { "outbound": "direct", "server": "local" }
+    ],
+    "final": "remote"
+  }
+}
