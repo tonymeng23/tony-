@@ -164,6 +164,31 @@ ip saddr 192.168.0.114 return
 - **N1 上 busybox `netstat` 显示不可靠**：核对监听端口用 `/proc/net/tcp` + 端口号十六进制（如 `11211` → `2BC3`、`11111` → `2B67`）。
 - **`pkill -f "run -c /tmp/sb-test"` 会匹配到 ssh 自身 shell** 把会话杀掉 → 用 `pgrep` 拿精确 PID 再 `kill -9`。
 
+### 3.6 手机打不开 Instagram（同网关 .2，但 QUIC 被默认 ACL gfw 集合 DROP）
+
+现象：网关/DNS 都是 `.2`，`www.instagram.com` 能开，但 **IG App 打不开**（转圈/超时）。Mac（同网关）能连、手机不能——典型双端差异。
+
+**根因（与 3.1 完全不同，别混）**：不是 DNS、不是出口 IP 类型、不是 IPv6 泄漏，而是 **Instagram 重度依赖 QUIC（UDP/443），而 PassWall 把「默认 ACL gfw 集合 `psw_cfg1330ec_gfw`」里的 UDP/443 流量直接 `drop`**。
+
+排查关键证据链：
+1. `dig api.i.instagram.com` 返回 **NXDOMAIN**——这是 IG 的 canary/探测域名（Facebook 权威 DNS 本就无此记录），**与打不开无关**，是干扰项；真正 API 域名是 `i.instagram.com`，N1 各 DNS 跳点都能解析出真实 FB IP `57.144.64.192`。
+2. 强制走 sing-box HK 出口 `:11111` 时 `i.instagram.com` → HTTP=404（通）、FB/Twitter/Google/YouTube 全通 → **出口本身正常**，问题在透明代理的 QUIC 分流。
+3. `nft list ruleset` 显示 `inet passwall PSW_MANGLE` 中存在 `ip daddr @psw_cfg1330ec_gfw udp dport 443 ... drop comment "cfg2730ec"`（已丢 126 包 / 220KB）。同集合 `psw_gfw` 的 QUIC 在另一规则是 `tproxy to :1041`（走代理）——**两条不对称**，FB/IG 的 QUIC 被静默丢弃，App 回退不及时即表现为打不开。
+4. 注意：`.1`（TP-Link）作 DHCP 主 DNS 时 FB 域名曾被 GFW 污染（假 IP `108.160.169.186`）；但用户重置 TP-Link 并改好 DHCP 后 `.1` 已回到真实 FB IP，**所以本次根因是 QUIC 丢弃，不是 DNS**。Mac 只用 `.2` 所以一直正常。
+
+**修复（零 reload、零 OOM 风险，仅 nft 运行时操作）**：
+```sh
+# 在 PSW_MANGLE 链顶部插入：FB/IG 的 QUIC 改走代理 :1041（与 psw_gfw 的 QUIC 处理对称）
+nft insert rule inet passwall PSW_MANGLE \
+  ip protocol udp udp dport 443 ip daddr @psw_cfg1330ec_gfw \
+  counter meta mark set 0x50535731 tproxy ip to :1041 comment "fix-ig-quic"
+```
+验证：从内网发 UDP 包到 `57.144.64.192:443`，`fix-ig-quic` 计数器 `0 → 1`，证明命中、QUIC 已从「丢弃」转为「走代理」。
+
+**持久化**：并入开机脚本 `/mnt/mmc1-4/fix-gfw-acl-set.sh`（rc.local `sleep 150` 后执行，幂等），新增 `fix-ig-quic` 块；同脚本原有的 TCP `fix-global-gfw` 与 QUIC `fix-quic-gfw` 块也顺便修了默认 ACL gfw 集合不填充的同类问题。
+
+> ⚠️ **千万别**：为修 IG 去 `reload`/`restart passwall`——会 OOM 卡死 N1 全家断网。只用 `nft insert rule` 加运行时规则 + 开机脚本兜底。
+
 ---
 
 ## 4. Home Assistant
