@@ -189,6 +189,30 @@ nft insert rule inet passwall PSW_MANGLE \
 
 > ⚠️ **千万别**：为修 IG 去 `reload`/`restart passwall`——会 OOM 卡死 N1 全家断网。只用 `nft insert rule` 加运行时规则 + 开机脚本兜底。
 
+### 3.6.1 根治修订（初版 `fix-ig-quic` 指向 `:1041` 实际不通）
+
+初版把 FB/IG 的 QUIC 指向 `:1041`（sslocal），但实测 `:1041` / `xray :11201` 这两个 passwall 自带的 UDP 代理通道**对 X/IG 全部不通（curl 代理测试 `000`）**——它们是死通道。结果：IG 刷几条卡死、X 压根打不开（X 用 Cloudflare，IP `172.66.0.227` 不在 gfw 集合，QUIC 按默认 ACL 兜底直连被墙；而 TCP 走代理正常，所以 Mac 用 curl 测 X=200）。
+
+**真正根因升级**：passwall 当前**完全没有可用的 UDP 代理出口**——sing-box 只配置了 TCP 入站（`:11211` redirect / `:11111` socks），没有任何 UDP 入站。所以所有 QUIC 流量要么直连被墙（X）、要么走死通道 `:1041`（IG 卡）。
+
+**根治（一次性，已验证）**：给 sing-box 加一个 **UDP tproxy 入站 `:11212`**，让 QUIC 也走已验证健康的 sing-box 出口（HK 家宽），再把非国内 UDP 统一重定向过去。
+1. 改 `/mnt/mmc1-4/pw-failover/pw-fo.json` 的 `inbounds`，追加：
+   ```json
+   { "type": "tproxy", "tag": "tproxy-udp", "listen": "0.0.0.0", "listen_port": 11212, "network": ["udp"] }
+   ```
+   （改完先 `sing-box check -c pw-fo.json` 校验；`kill` 主进程后看门狗会自动拉起，出口 IP 仍是 HK 家宽、TCP 代理不中断）
+2. 在 `PSW_MANGLE` 链顶部插入全量 UDP 代理规则（国内/内网 UDP 直连、其余走 `:11212`）：
+   ```sh
+   nft insert rule inet passwall PSW_MANGLE ip protocol udp counter meta mark set 0x50535731 tproxy ip to :11212 comment "udp-all-proxy"
+   nft insert rule inet passwall PSW_MANGLE ip protocol udp ip daddr @psw_lan return comment "udp-lan-return"
+   nft insert rule inet passwall PSW_MANGLE ip protocol udp ip daddr @psw_chn return comment "udp-chn-return"
+   ```
+3. 验证：从内网发 QUIC 包到 X/IG 的 443，规则计数器增长（实测从 12 → 77 包，含真实手机流量）；X/IG App 恢复正常。
+
+**持久化**：`udp-all-proxy` 块已并入 `/mnt/mmc1-4/fix-gfw-acl-set.sh`（rc.local `sleep 150` 执行，幂等）；`pw-fo.json` 的 `:11212` 入站已写盘。N1 重启后自动恢复。
+
+> 这次教训：**排查 QUIC 要先确认 UDP 代理通道本身通不通**（`curl -x socks5h://127.0.0.1:<端口>` 实测），不能假设 passwall 自带的 `:1041` / `:11201` 一定可用。
+
 ---
 
 ## 4. Home Assistant
