@@ -115,6 +115,88 @@ ip saddr 192.168.0.114 return
 
 ---
 
+### 2.5 实况核查：passwall 到底是"规则代理"还是"全局代理"？（2026-09-03）
+
+**结论：都不是——它是 `disable` + ACL 驱动的「绕过中国大陆（chnroute 白名单）」准全局代理。**
+
+#### 一、配置项实况
+
+```sh
+uci show passwall.@global[0] | grep -iE "proxy_mode"
+# passwall.cfg023fd6.tcp_proxy_mode='disable'   ← 主引擎关闭
+# passwall.cfg023fd6.udp_proxy_mode='disable'   ← 主引擎关闭
+# passwall.cfg023fd6.dns_mode='xray'
+# passwall.cfg023fd6.dns_redirect='1'
+# passwall.cfg023fd6.chn_list='direct'
+```
+
+| ACL | 备注 | TCP | UDP | 源 |
+|---|---|---|---|---|
+| `@acl_rule[0]` | NAS-114-direct | `direct` | `direct` | 192.168.0.114 |
+| `@acl_rule[1]` | cfg2730ec（默认，无源限制=全部设备） | **`proxy`** | **`proxy`** | 全部 |
+
+即：**passwall 的全局开关是 `disable`，真正干活的是默认 ACL（cfg2730ec）生成的 nft 规则段。**
+
+#### 二、`PSW_NAT`（TCP）实际判定顺序（带实测命中数）
+
+| # | 规则 | 行为 | 命中 |
+|---|---|---|---|
+| 1 | `ip saddr 192.168.0.114 tcp` | return（NAS 直连） | — |
+| 2 | `@psw_lan` | return | 179933 |
+| 3-4 | `@psw_vps` / `@psw_wan` | return | 10 / 0 |
+| 5 | `@psw_block` | drop | 0 |
+| 6 | `@psw_white` | return | 2334 |
+| 7 | 端口表 + `@psw_cfg1330ec_black` | redirect → `:11211` | 490 |
+| 8 | 端口表 + `@psw_cfg1330ec_gfw` | redirect → `:11211` | **23098** |
+| 9 | 端口表 + `@psw_chn` | **return（国内直连）** | **111238** |
+| 10 | **端口表（无条件）** | **redirect → `:11211`（兜底全代理）** | **9713** |
+| 11-17 | 「默认」段（`disable` 无代理规则） | return | 29195 |
+
+**第 10 条是决定性的**：它没有任何 `daddr` 条件——凡是目的地不在内网/白名单/国内集合、且端口在表内的，**一律代理**。所以这不是 gfwlist「规则代理」（只在列表内才代理），而是**「非中国即代理」的 chnroute 白名单模式**。
+
+#### 三、`PSW_MANGLE`（UDP）同理
+
+```
+udp daddr @psw_chn  return                       # 国内直连
+udp daddr @psw_lan  return                       # 内网直连
+udp（无条件）        tproxy → :11212              # 兜底全代理，15438 包  ← 我们加的 udp-all-proxy
+udp dport 443 @psw_cfg1330ec_gfw  tproxy → :1041 # FB/IG QUIC，379 包   ← fix-ig-quic
+```
+
+#### 四、gfw 集合为什么那么大？
+
+实测 `www.iana.org` / `www.kernel.org` / `ftp.debian.org` 三个与"翻墙"毫无关系的域名，解析出的 IP **都在 `@psw_cfg1330ec_gfw` 集合里**。
+原因：chinadns-ng 走远端（代理）DNS 解析出的境外 IP，会被 `add-taggfw-ip` **动态打进 gfw 集合**。
+→ 所以「经 N1 解析的境外域名」几乎必然落进 gfw 集合、走第 8 条代理；第 10 条兜底则覆盖**不经过 N1 DNS** 的情况（例如设备直接用 `.1` 解析、或 App 硬编码 IP）。
+
+> ⚠️ 这也正是 3.6.2 那个坑的另一面：设备若用被投毒的 `.1` 解析，IP 虽会被第 10 条兜底代理，**但代理到一个根本不存在的假 IP 上，照样连不通**。
+
+#### 五、⚠️ 一个真实缺口：端口白名单之外的端口不走代理
+
+第 8/9/10 条都带端口表：
+
+```
+{ 22, 25, 53, 80, 143, 443, 465, 587, 853, 873, 993, 995, 5222, 8080, 8443, 9418 }
+```
+
+**不在这个表里的 TCP 端口一律不代理、直连**（会落到第 17 条 return）。
+受影响的典型：FCM 推送 `5228`、STUN/TURN `3478`、部分游戏与 VoIP 端口、非标准 HTTPS 端口（如 `4443`）。
+若某个 App"能连上但功能半残"，先查它用的端口在不在表里。
+
+#### 六、一键自查命令
+
+```sh
+ssh root@192.168.0.2 '
+uci show passwall.@global[0] | grep -iE "proxy_mode"
+n=0; while uci show passwall.@acl_rule[$n] >/dev/null 2>&1; do
+  echo "[$n] $(uci get passwall.@acl_rule[$n].remarks) tcp=$(uci get passwall.@acl_rule[$n].tcp_proxy_mode) udp=$(uci get passwall.@acl_rule[$n].udp_proxy_mode)"
+  n=$((n+1)); done
+nft list chain inet passwall PSW_NAT | grep -E "redirect|return|drop"
+'
+```
+
+---
+
 ## 3. 📱 手机打不开 X 的完整排障案例（数据中心 IP 被风控）
 
 这是最经典、最容易被误判的一案，完整复盘一遍，因为排查路径本身就有好几处坑。
